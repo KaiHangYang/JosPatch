@@ -1,0 +1,609 @@
+diff --git a/inc/memlayout.h b/inc/memlayout.h
+index d39c587..9036900 100644
+--- a/inc/memlayout.h
++++ b/inc/memlayout.h
+@@ -17,7 +17,7 @@
+ #define GD_KD     0x10     // kernel data
+ #define GD_UT     0x18     // user text
+ #define GD_UD     0x20     // user data
+-#define GD_TSS    0x28     // Task segment selector
++#define GD_TSS    0x28     // Task segment selector (LDT)
+ 
+ /*
+  * Virtual memory map:                                Permissions
+diff --git a/kern/console.c b/kern/console.c
+index 150fe16..e913965 100644
+--- a/kern/console.c
++++ b/kern/console.c
+@@ -150,7 +150,7 @@ cga_putc(int c)
+ 	// if no attribute given, then use black on white
+ 	if (!(c & ~0xFF))
+ 		c |= 0x0700;
+-
++    // change the high bits of the 16bit char can change the display mode
+ 	switch (c & 0xff) {
+ 	case '\b':
+ 		if (crt_pos > 0) {
+diff --git a/kern/env.c b/kern/env.c
+index 2d5cdca..2099cd1 100644
+--- a/kern/env.c
++++ b/kern/env.c
+@@ -72,6 +72,16 @@ void
+ env_init(void)
+ {
+ 	// LAB 3: Your code here.
++    cprintf("env_init called!\n");
++    int i;
++    LIST_INIT(&env_free_list);
++    for (i = NENV - 1; i >= 0; --i) {
++        envs[i].env_id = 0; // be care the element in arr
++        LIST_INSERT_HEAD(&env_free_list, &envs[i], env_link);
++    }
++
++    cprintf("env_init succeeded!\n");
++    return;
+ }
+ 
+ //
+@@ -110,9 +120,20 @@ env_setup_vm(struct Env *e)
+ 	//	env_pgdir's pp_ref!
+ 
+ 	// LAB 3: Your code here.
+-
++    pde_t * pde = page2kva(p);
++    memset(pde, 0, PGSIZE);
++    e->env_pgdir = pde;
++    e->env_cr3 = PADDR(pde);
++    p->pp_ref++;
++    
++
++    // set the map of the v space above UTOP the VPT and UVPT will be changed bellow 
++    //int i;
++    for (i = PDX(UTOP); i < NPDENTRIES; ++i) {
++        e->env_pgdir[i] = boot_pgdir[i]; // use boot_pgdir as an template
++    }
+ 	// VPT and UVPT map the env's own page table, with
+-	// different permissions.
++	// different permissions. Above  ULIM  user has no accessment, bellow the user can read
+ 	e->env_pgdir[PDX(VPT)]  = e->env_cr3 | PTE_P | PTE_W;
+ 	e->env_pgdir[PDX(UVPT)] = e->env_cr3 | PTE_P | PTE_U;
+ 
+@@ -144,7 +165,7 @@ env_alloc(struct Env **newenv_store, envid_t parent_id)
+ 	// Generate an env_id for this environment.
+ 	generation = (e->env_id + (1 << ENVGENSHIFT)) & ~(NENV - 1);
+ 	if (generation <= 0)	// Don't create a negative env_id.
+-		generation = 1 << ENVGENSHIFT;
++		generation = 1 << ENVGENSHIFT; // loop
+ 	e->env_id = generation | (e - envs);
+ 	
+ 	// Set the basic status variables.
+@@ -168,7 +189,7 @@ env_alloc(struct Env **newenv_store, envid_t parent_id)
+ 	e->env_tf.tf_ss = GD_UD | 3;
+ 	e->env_tf.tf_esp = USTACKTOP;
+ 	e->env_tf.tf_cs = GD_UT | 3;
+-	// You will set e->env_tf.tf_eip later.
++	// You will set e->env_tf.tf_eip later. when load_icode
+ 
+ 	// commit the allocation
+ 	LIST_REMOVE(e, env_link);
+@@ -194,6 +215,21 @@ segment_alloc(struct Env *e, void *va, size_t len)
+ 	// Hint: It is easier to use segment_alloc if the caller can pass
+ 	//   'va' and 'len' values that are not page-aligned.
+ 	//   You should round va down, and round len up.
++    struct Page * p;
++    uintptr_t vaddr = ROUNDDOWN((uintptr_t)va, PGSIZE);
++    size_t length = ROUNDUP(len, PGSIZE); // Be carefull not to make low mistake!!!!!
++    uint32_t num = length/PGSIZE;
++    uint32_t i;
++    for (i = 0; i < num; ++i) {
++        if (page_alloc(&p) != 0) {
++            panic("segment_alloc => page_alloc failed!\n");
++            return;
++        }
++        if (page_insert(e->env_pgdir, p, (void *)(vaddr + i*PGSIZE), PTE_U|PTE_W) != 0) {
++            panic("segment_alloc => page_insert failed!\n");
++            return;
++        }
++    }
+ }
+ 
+ //
+@@ -256,6 +292,47 @@ load_icode(struct Env *e, uint8_t *binary, size_t size)
+ 	// at virtual address USTACKTOP - PGSIZE.
+ 
+ 	// LAB 3: Your code here.
++    cprintf("load_icode called!\n");
++    struct Elf * elf_header;
++    struct Proghdr * p_header;
++    int i;
++    uint32_t tmp_pgdir = rcr3();
++
++    elf_header = (struct Elf *)binary;
++    if (elf_header->e_magic != ELF_MAGIC) {
++        return;
++    }
++    
++    // change pgdir
++    lcr3(e->env_cr3);
++
++    // the first segment
++    p_header = (struct Proghdr *)((uint32_t)elf_header + elf_header->e_phoff);
++    // load the progment segment
++    for (i=0; i < elf_header->e_phnum; ++i) {
++        cprintf("p_header p_va:0x%x   p_memsz:0x%x p_type: %d\n", p_header->p_va, p_header->p_memsz, p_header->p_type == ELF_PROG_LOAD);
++        if (p_header->p_type == ELF_PROG_LOAD) {
++            // load p_filesz block from p_offset in p_va (size : p_memsz)
++            segment_alloc(e, (void *)p_header->p_va, p_header->p_memsz);
++            //memset((void *)p_header->p_va, 0, p_header->p_memsz);
++            memmove((void *)(p_header->p_va),(void *)((uint32_t)elf_header+p_header->p_offset), p_header->p_filesz); // the ph_offsdet is relative to the elf_header!
++        }
++        p_header++;
++    }
++
++    e->env_tf.tf_eip = elf_header->e_entry;
++
++    // map stack
++    struct Page * pg;
++    if (page_alloc(&pg) != 0) {
++        panic("load_icode => page_alloc failed!\n");
++        return;
++    }
++    page_insert(e->env_pgdir, pg, (void *)(USTACKTOP - PGSIZE), PTE_U|PTE_W);
++    // reload the cr3
++    lcr3(tmp_pgdir);
++
++    cprintf("load_icode succeeded!\n");
+ }
+ 
+ //
+@@ -272,6 +349,15 @@ void
+ env_create(uint8_t *binary, size_t size)
+ {
+ 	// LAB 3: Your code here.
++    //
++    cprintf("env_create called!\n");
++    struct Env * tmp_env;
++    if (env_alloc(&tmp_env, 0) != 0) {
++        panic("env_create => env_alloc failed!\n");
++        return;
++    }
++    load_icode(tmp_env, binary, size);
++    cprintf("env_create succeeded!\n");
+ }
+ 
+ //
+@@ -383,7 +469,12 @@ env_run(struct Env *e)
+ 	//	e->env_tf to sensible values.
+ 	
+ 	// LAB 3: Your code here.
+-
+-        panic("env_run not yet implemented");
++    cprintf("env_run called!\n");
++    curenv = e;
++    e->env_runs++;
++    lcr3(e->env_cr3);
++    env_pop_tf(&(e->env_tf));
++    cprintf("env_run succeeded!\n");
++        //panic("env_run not yet implemented");
+ }
+ 
+diff --git a/kern/kdebug.c b/kern/kdebug.c
+index c3e1790..635fdac 100644
+--- a/kern/kdebug.c
++++ b/kern/kdebug.c
+@@ -202,10 +202,18 @@ debuginfo_eip(uintptr_t addr, struct Eipdebuginfo *info)
+ 	// Hint:
+ 	//	There's a particular stabs type used for line numbers.
+ 	//	Look at the STABS documentation and <inc/stab.h> to find
+-	//	which one.
++	//	which one. N_SLINE
+ 	// Your code here.
+-
+-	
++    
++    stab_binsearch(stabs, &lline, &rline, N_SLINE, addr);
++	if (lline <= rline) {
++        // find the code line 
++        // then get the line num
++        info->eip_line = stabs[lline].n_desc;// n_desc is the N_SLINE 's linenumber
++    }
++    else {
++        return -1; // not found
++    }
+ 	// Search backwards from the line number for the relevant filename
+ 	// stab.
+ 	// We can't just use the "lfile" stab because inlined functions
+@@ -222,7 +230,14 @@ debuginfo_eip(uintptr_t addr, struct Eipdebuginfo *info)
+ 	// Set eip_fn_narg to the number of arguments taken by the function,
+ 	// or 0 if there was no containing function.
+ 	// Your code here.
+-
++    while (lfun <= rfun) {
++        // begin to find the PSYM
++        if (stabs[lfun].n_type == N_PSYM) {
++            // this stab entry is argument
++            ++info->eip_fn_narg;
++        }
++        ++lfun;
++    }
+ 	
+ 	return 0;
+ }
+diff --git a/kern/monitor.c b/kern/monitor.c
+index 80a7904..49df563 100644
+--- a/kern/monitor.c
++++ b/kern/monitor.c
+@@ -25,6 +25,7 @@ struct Command {
+ static struct Command commands[] = {
+ 	{ "help", "Display this list of commands", mon_help },
+ 	{ "kerninfo", "Display information about the kernel", mon_kerninfo },
++    { "backtrace", "Backtrace the execution", mon_backtrace },
+ };
+ #define NCOMMANDS (sizeof(commands)/sizeof(commands[0]))
+ 
+@@ -61,6 +62,53 @@ int
+ mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+ {
+ 	// Your code here.
++    uint32_t ebp = read_ebp(); //read the ebp of this func
++    uintptr_t eip = read_eip();
++    uintptr_t pre_eip = *((uint32_t *)ebp + 1);
++    
++    cprintf("Stack backtrace:\n"); // the output mode is wrong. You can see the vcprintfmt's implementations %0.8x is wrong
++    struct Eipdebuginfo info;
++    char fun_name[100];
++    int i;
++    while (ebp > 0) {
++        if (debuginfo_eip(eip, &info) >= 0) {
++            // success
++            for (i = 0; i < info.eip_fn_namelen; i++) {
++                fun_name[i] = info.eip_fn_name[i];
++            }
++            fun_name[i] = '\0';
++            cprintf("%s:%d:%s:args %d\n", info.eip_file, info.eip_line, fun_name, info.eip_fn_narg);
++        }
++        else {
++            cprintf("Call debuginfo_eip failed!\n");
++        }
++        cprintf("  ebp %08x eip %08x args ", ebp, *((uint32_t *)ebp + 1));
++        switch(info.eip_fn_narg) {
++            case 0:
++                cprintf("NULL\n");
++                break;
++            case 1:
++                cprintf("%08x\n", *((uint32_t *)ebp + 2));
++                break;
++            case 2:
++                cprintf("%08x %08x\n", *((uint32_t *)ebp + 2), *((uint32_t *)ebp + 3));
++                break;
++            case 3:
++                cprintf("%08x %08x %08x\n", *((uint32_t *)ebp + 2), *((uint32_t *)ebp + 3), *((uint32_t *)ebp + 4));
++                break;
++            case 4:
++                cprintf("%08x %08x %08x %08x\n", *((uint32_t *)ebp + 2), *((uint32_t *)ebp + 3), *((uint32_t *)ebp + 4), *((uint32_t *)ebp + 5));
++                break;
++            default:
++                cprintf("%08x %08x %08x %08x %08x\n", *((uint32_t *)ebp + 2), *((uint32_t *)ebp + 3), *((uint32_t *)ebp + 4), *((uint32_t *)ebp + 5), *((uint32_t *)ebp + 6));
++        }
++        ebp = *(uint32_t *)ebp;
++        if (ebp == 0) {
++            break;
++        }
++        eip = pre_eip;
++        pre_eip = *((uint32_t *)ebp + 1);
++    }
+ 	return 0;
+ }
+ 
+diff --git a/kern/pmap.c b/kern/pmap.c
+index 80a0839..88b1cde 100644
+--- a/kern/pmap.c
++++ b/kern/pmap.c
+@@ -122,8 +122,13 @@ boot_alloc(uint32_t n, uint32_t align)
+ 	//	Step 2: save current value of boot_freemem as allocated chunk
+ 	//	Step 3: increase boot_freemem to record allocation
+ 	//	Step 4: return allocated chunk
+-
+-	return NULL;
++    // there are useful macros in type.h
++    
++    boot_freemem = ROUNDUP(boot_freemem, align); // saved
++    v = boot_freemem;
++    boot_freemem += ROUNDUP(n, align);
++    
++	return v;
+ }
+ 
+ // Set up a two-level page table:
+@@ -146,7 +151,7 @@ i386_vm_init(void)
+ 	size_t n;
+ 
+ 	// Delete this line:
+-	panic("i386_vm_init: This function is not finished\n");
++	//panic("i386_vm_init: This function is not finished\n");
+ 
+ 	//////////////////////////////////////////////////////////////////////
+ 	// create initial page directory.
+@@ -175,12 +180,13 @@ i386_vm_init(void)
+ 	// programs will get read-only access to the array as well.
+ 	// You must allocate the array yourself.
+ 	// Your code goes here: 
+-
++    
++    pages = (struct Page *)(boot_alloc(sizeof(struct Page) * npage, PGSIZE));
+ 
+ 	//////////////////////////////////////////////////////////////////////
+ 	// Make 'envs' point to an array of size 'NENV' of 'struct Env'.
+ 	// LAB 3: Your code here.
+-
++    envs = (struct Env *)(boot_alloc(sizeof(struct Env) * NENV, PGSIZE));
+ 	//////////////////////////////////////////////////////////////////////
+ 	// Now that we've allocated the initial kernel data structures, we set
+ 	// up the list of free physical pages. Once we've done so, all further
+@@ -202,14 +208,15 @@ i386_vm_init(void)
+ 	//    - pages -- kernel RW, user NONE
+ 	//    - the read-only version mapped at UPAGES -- kernel R, user R
+ 	// Your code goes here:
+-
++    
++    boot_map_segment(pgdir, UPAGES, ROUNDUP(npage*sizeof(struct Page), PGSIZE), PADDR(pages), PTE_U|PTE_P);
+ 	//////////////////////////////////////////////////////////////////////
+ 	// Map the 'envs' array read-only by the user at linear address UENVS
+ 	// (ie. perm = PTE_U | PTE_P).
+ 	// Permissions:
+ 	//    - envs itself -- kernel RW, user NONE
+ 	//    - the image of envs mapped at UENVS  -- kernel R, user R
+-
++    boot_map_segment(pgdir, UENVS, ROUNDUP(NENV*sizeof(struct Env), PGSIZE), PADDR(envs), PTE_P|PTE_U);
+ 
+ 	//////////////////////////////////////////////////////////////////////
+ 	// Map the kernel stack (symbol name "bootstack").  The complete VA
+@@ -219,7 +226,7 @@ i386_vm_init(void)
+ 	//     * [KSTACKTOP-PTSIZE, KSTACKTOP-KSTKSIZE) -- not backed => faults
+ 	//     Permissions: kernel RW, user NONE
+ 	// Your code goes here:
+-
++    boot_map_segment(pgdir, KSTACKTOP-KSTKSIZE, KSTKSIZE, PADDR(bootstack), PTE_W|PTE_P);
+ 	//////////////////////////////////////////////////////////////////////
+ 	// Map all of physical memory at KERNBASE. 
+ 	// Ie.  the VA range [KERNBASE, 2^32) should map to
+@@ -228,7 +235,7 @@ i386_vm_init(void)
+ 	// we just set up the amapping anyway.
+ 	// Permissions: kernel RW, user NONE
+ 	// Your code goes here: 
+-
++    boot_map_segment(pgdir, KERNBASE, 0x10000000, 0, PTE_W|PTE_P); // totally 256MB
+ 	// Check that the initial page directory has been set up correctly.
+ 	check_boot_pgdir();
+ 
+@@ -452,6 +459,14 @@ page_init(void)
+ 		pages[i].pp_ref = 0;
+ 		LIST_INSERT_HEAD(&page_free_list, &pages[i], pp_link);
+ 	}
++    pages[0].pp_ref = 1; // page 0 is used 
++    LIST_REMOVE(&pages[0], pp_link);
++    int used_start = PPN(IOPHYSMEM);
++    int used_end = PPN(boot_freemem);
++    for (i = used_start; i < used_end; ++i) {
++        pages[i].pp_ref = 1;
++        LIST_REMOVE(&pages[i], pp_link);
++    }
+ }
+ 
+ //
+@@ -482,8 +497,16 @@ page_initpp(struct Page *pp)
+ int
+ page_alloc(struct Page **pp_store)
+ {
+-	// Fill this function in
+-	return -E_NO_MEM;
++	struct Page * first = LIST_FIRST(&page_free_list);
++    if (first == NULL) {
++        // there is no free page
++        *pp_store = NULL;
++	    return -E_NO_MEM;
++    }
++    LIST_REMOVE(first, pp_link);
++    page_initpp(first);
++    *pp_store = first;
++    return 0;
+ }
+ 
+ //
+@@ -494,6 +517,13 @@ void
+ page_free(struct Page *pp)
+ {
+ 	// Fill this function in
++    if (pp->pp_ref != 0) {
++        panic("page_free: reference count of this page is not 0!");
++    }
++    else {
++        page_initpp(pp);
++        LIST_INSERT_HEAD(&page_free_list, pp, pp_link);
++    }
+ }
+ 
+ //
+@@ -523,8 +553,33 @@ page_decref(struct Page* pp)
+ pte_t *
+ pgdir_walk(pde_t *pgdir, const void *va, int create)
+ {
++    //cprintf("pgdir_walk called\n");
+ 	// Fill this function in
+-	return NULL;
++    pte_t * pgtable = (pte_t *)pgdir[PDX(va)]; // page dir entry
++
++    pte_t * result = NULL;
++
++    if (((uint32_t)pgtable & PTE_P) == 0) {
++        // don't exist
++        if (create == 0) {
++            return NULL;
++        }
++        
++        // create
++        struct Page * pt_tmp;
++        if (page_alloc(&pt_tmp) != 0) {
++            return NULL;
++        }
++        pt_tmp->pp_ref = 1;
++        memset(page2kva(pt_tmp), 0, PGSIZE); // clear the new allocted mem
++        pgdir[PDX(va)] = page2pa(pt_tmp) | PTE_U | PTE_W | PTE_P; // see the manual
++        result = (pte_t *)page2kva(pt_tmp); // return the visual address
++    }
++    else {
++        // there exist a page table;
++        result = (pte_t *)page2kva(pa2page(PTE_ADDR(pgtable)));
++    }
++    return &(result[PTX(va)]);
+ }
+ 
+ //
+@@ -535,7 +590,7 @@ pgdir_walk(pde_t *pgdir, const void *va, int create)
+ // Details
+ //   - If there is already a page mapped at 'va', it is page_remove()d.
+ //   - If necessary, on demand, allocates a page table and inserts it into
+-//     'pgdir'.
++//     'pgdir'. page_walk will do it
+ //   - pp->pp_ref should be incremented if the insertion succeeds.
+ //   - The TLB must be invalidated if a page was formerly present at 'va'.
+ //
+@@ -548,15 +603,33 @@ pgdir_walk(pde_t *pgdir, const void *va, int create)
+ //
+ int
+ page_insert(pde_t *pgdir, struct Page *pp, void *va, int perm) 
+-{
++{   
++    //cprintf("page_insert called\n");
+ 	// Fill this function in
+-	return 0;
++    // there exist a problem if pp's la is va what will happened?
++    pte_t * pte = pgdir_walk(pgdir, va, 1);
++
++    // new page table maybe alloced by pgdir_walk
++    if (pte == NULL) {
++        return -E_NO_MEM;
++    }
++    else {
++        ++pp->pp_ref;
++        if (((*pte) & PTE_P) != 0) {
++            // the page is presented so remove
++            page_remove(pgdir, va);
++        }
++        *pte = page2pa(pp) | perm | PTE_P;
++        // ++pp->pp_ref; should be done before remove, or the page will be put into the free_list!!!
++	    return 0;  
++    }
++    
+ }
+ 
+ //
+ // Map [la, la+size) of linear address space to physical [pa, pa+size)
+ // in the page table rooted at pgdir.  Size is a multiple of PGSIZE.
+-// Use permission bits perm|PTE_P for the entries.
++// Use permission bits perm|PTE_P for the entries. PTE_P is present 
+ //
+ // This function is only intended to set up the ``static'' mappings
+ // above UTOP. As such, it should *not* change the pp_ref field on the
+@@ -566,7 +639,23 @@ page_insert(pde_t *pgdir, struct Page *pp, void *va, int perm)
+ static void
+ boot_map_segment(pde_t *pgdir, uintptr_t la, size_t size, physaddr_t pa, int perm)
+ {
+-	// Fill this function in
++    //cprintf("boot_map_segment called\n");
++    // cause every page has 4k size, and address in one page will be maped to the same page 
++    // align
++    size = ROUNDUP(size, PGSIZE);
++    // prevent some thing wrong, though may never happen
++    uint32_t i;
++    pte_t * pte;
++    for(i = 0; i < size; i += PGSIZE) {
++        pte = pgdir_walk(pgdir, (void *)(la+i), 1);
++        // failed
++        if (pte == NULL) {
++            panic("boot_map_segment failed!");
++            return;
++        }
++
++        *pte = (pa+i) | perm | PTE_P;
++    }
+ }
+ 
+ //
+@@ -582,8 +671,25 @@ boot_map_segment(pde_t *pgdir, uintptr_t la, size_t size, physaddr_t pa, int per
+ struct Page *
+ page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
+ {
++    //cprintf("page_lookup called\n");
+ 	// Fill this function in
+-	return NULL;
++    pte_t * pgte = pgdir_walk(pgdir, va, 0);
++    
++
++    if (pgte == NULL) {
++        return 0;
++    }
++    if (pte_store != 0) {
++        *pte_store = pgte;
++    }
++
++    if (*pgte != (pte_t)NULL) {
++        assert(PPN(*pgte) < npage);
++        return pa2page(*pgte);// this place may map into that page.
++    }
++    else {
++        return NULL;
++    }
+ }
+ 
+ //
+@@ -605,6 +711,17 @@ void
+ page_remove(pde_t *pgdir, void *va)
+ {
+ 	// Fill this function in
++    //cprintf("page_remove called\n");
++    pte_t * pg_store;
++    struct Page * pg;
++    pg = page_lookup(pgdir, va, &pg_store);
++    if (pg != NULL) {
++        page_decref(pg);
++        if (pg_store != NULL) {
++            *pg_store = 0;
++        }
++        tlb_invalidate(pgdir, va);
++    }
+ }
+ 
+ //
+@@ -708,7 +825,7 @@ page_check(void)
+ 	assert(page_insert(boot_pgdir, pp2, (void*) PGSIZE, 0) == 0);
+ 	assert(check_va2pa(boot_pgdir, PGSIZE) == page2pa(pp2));
+ 	assert(pp2->pp_ref == 1);
+-
++    
+ 	// should be no free memory
+ 	assert(page_alloc(&pp) == -E_NO_MEM);
+ 
+diff --git a/lib/printfmt.c b/lib/printfmt.c
+index 6aa8cc3..7a64cdb 100644
+--- a/lib/printfmt.c
++++ b/lib/printfmt.c
+@@ -207,11 +207,13 @@ vprintfmt(void (*putch)(int, void*), void *putdat, const char *fmt, va_list ap)
+ 		// (unsigned) octal
+ 		case 'o':
+ 			// Replace this with your code.
+-			putch('X', putdat);
+-			putch('X', putdat);
+-			putch('X', putdat);
+-			break;
+-
++            num = getuint(&ap, lflag);
++            if ((long long)num < 0) {
++                putch('-', putdat);
++				num = -(long long) num;
++            }
++            base = 8;
++            goto number;
+ 		// pointer
+ 		case 'p':
+ 			putch('0', putdat);
